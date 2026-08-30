@@ -36,17 +36,6 @@ Salesperson AI is already one of the more autonomous agents in Tekion's portfoli
 
 The proposal: a **confidence-routed evaluation layer** sitting between response generation and send — combining an **LLM-as-judge rubric score** (is this response good) with an **objective confidence signal** (how sure is the model it's right) into one routing decision: auto-send, hold for human review, or escalate. Full detail in `PRD.md` and `eval-framework.md`.
 
-## Pushing this to GitHub
-
-```bash
-cd tekion-salesperson-ai-eval
-git remote add origin https://github.com/prasshaa/tekion-salesperson-ai-eval.git
-git branch -M main
-git push -u origin main
-```
-
-Then enable **Settings → Pages → Deploy from branch → main / (root)** to serve `demo/index.html` publicly.
-
 ---
 
 *This is an independent case study built for interview purposes. Not affiliated with or endorsed by Tekion Corp. All product names, screenshots, and public statements referenced belong to Tekion and are cited from their public website and job postings as of August 2026.*
