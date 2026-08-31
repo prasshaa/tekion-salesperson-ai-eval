@@ -86,6 +86,7 @@ This is a narrower claim than the original version — and a more honest one: re
 - **FR5**: Tier 0's classifier and Tier 1's rule set are updated on a defined cadence using confirmed violations Tier 2 surfaces — the feedback loop is a requirement, not a side effect.
 - **FR6**: Every classification, check, and async score is logged and queryable — extends the existing Communication Hub audit trail rather than replacing it.
 - **FR7**: A rolling dashboard (judge/human agreement, safety violation rate, Tier 0/1 catch rate, time-to-detect, time-to-remediate) is available to the CRM AI product team and, in a lighter form, to dealers.
+- **FR8**: Any change to Salesperson AI's generation prompt or underlying model, any new Tier 1 rule sourced from a Tier 2 finding, and any retrained Tier 0 classifier must pass an **offline regression gate** — evaluated against the labeled gold-set, with no regression in Safety/Escalation scores or false-positive rate — before it ships to production (see `eval-framework.md` §5.1). Nothing that changes what's live ships without first being checked against this held-out set.
 
 ### Non-functional
 - **NFR1 — Latency budget (Tiers 0+1 only)**: Combined, these must add no more than ~50–150ms to the autonomous-send path — a small classifier plus rule/lookup checks, no full LLM judge call in this budget. This is the only tier with a real latency constraint.

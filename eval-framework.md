@@ -2,6 +2,18 @@
 
 This is the technical companion to [`PRD.md`](./PRD.md). Where the PRD makes the product case, this document makes the methodology case: what "good" evaluation looks like in 2026, why each design choice here reflects current industry practice rather than a naive first pass, and exactly how the judge prompt and confidence signal are built.
 
+### How this maps to offline / inline / online evals
+
+The tier vocabulary used throughout this doc (Tier 0/1/2) describes *where in the pipeline* each check runs. It's worth mapping that explicitly onto the standard eval taxonomy, since that's the vocabulary most eval work actually gets discussed in:
+
+| Standard term | Runs where | Maps to |
+|---|---|---|
+| **Inline** | Synchronously, in the live request path, before the reply reaches the customer — has to be cheap, since it's on the critical path | **Tier 0 + Tier 1** — the topic classifier and the deterministic pattern/inventory checks are inline guardrails |
+| **Online** | Continuously, on live production traffic, async | **Tier 2** — the judge + confidence scoring on every autonomously-sent reply |
+| **Offline** | Against a static, curated, labeled dataset — not live traffic — as a pre-deployment gate | The gold-set in §5 — used both to calibrate the judge, **and** (§5.1, below) as a release gate before anything changes what's live |
+
+The first version of this framework only used offline evaluation to calibrate the judge itself — it never described using that same gold-set to gate a *change* before it ships. §5.1 fixes that.
+
 ---
 
 ## 1. Why This Needs Two Separate Signals, Not One
@@ -150,6 +162,16 @@ A judge (and a confidence signal) is only as trustworthy as its calibration disc
 - **Frontier cross-check**: 5–10% of the distilled judge's production scores are re-scored by a frontier-tier judge on a rolling basis, to catch drift between calibration cycles rather than waiting for the next quarterly refresh.
 - **Versioning discipline**: the tuple (judge model ID, rubric version, prompt template hash) is pinned per deployment. Any change to any part of that tuple is treated as an evaluation-suite migration — re-run against the gold-set, re-measure κ, don't ship silently. Swapping the judge model without re-calibration is a common, avoidable failure mode.
 - **Confidence-signal calibration**: the conformal layer (§3.3–3.4) is calibrated on its own held-out set, separate from the judge's gold-set, since it's answering a different question (how reliable is this specific reply likely to be) than the judge (was this specific reply good) — and given §3.4's exchangeability caveat, this calibration set is refreshed on a **rolling basis**, not a fixed quarterly cadence like the judge's gold-set, since inventory and model drift can invalidate it faster than a quarter.
+
+### 5.1 The Offline Regression Gate (what was missing)
+
+Everything above uses the gold-set to answer "is the judge itself trustworthy." It doesn't answer a different, equally important question: **before something changes what's live, does it make things worse?** That's what an offline regression gate is for, and it applies to three different kinds of change, each of which currently has no pre-deployment check:
+
+- **A change to Salesperson AI's generation prompt or underlying model** (including a model swap via the LLM Gateway) — run the new configuration against the offline gold-set (a labeled set spanning pricing, financing, trade-in, escalation triggers, and adversarial cases) before it ships. Fail the gate on any regression in Safety or Escalation dimension scores versus the currently-live configuration — these two are non-negotiable, since they're the hard-cap dimensions.
+- **A new Tier 1 deterministic rule sourced from a Tier 2 finding** (like the CPO-warranty example in the demo) — before the new pattern/lookup rule goes live, test it against the gold-set to confirm it doesn't introduce false-positive blocks on replies that were previously fine. A rule tuned too tightly to one incident can start holding back correct, routine replies.
+- **A change to Tier 0's topic classifier** — same idea: re-run against a held-out labeled set of message classifications before a retrained classifier replaces the live one, checking both catch rate (didn't get worse at flagging high-risk topics) and false-positive rate (didn't start routing routine questions to human-assist unnecessarily, which would quietly erode the product's speed advantage).
+
+None of these gates existed in the first version of this framework — offline evaluation was only ever used to check the judge's own trustworthiness, never as the thing standing between a change and production. This is the piece that turns "the system gets smarter over time" (§6's rules-added-per-cycle metric) into something that can't also make things worse over time.
 
 ---
 
