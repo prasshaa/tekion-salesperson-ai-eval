@@ -55,37 +55,44 @@ Without that layer, the product has exactly two failure-prone defaults: send eve
 
 ## 6. Proposed Solution — Overview
 
-Insert a **Confidence-Routed Evaluation Layer** between "Salesperson AI drafts a reply" and "reply is sent." Every drafted reply is scored on two independent axes and combined into one routing decision:
+The first pass at this proposal put a full LLM-as-judge + self-consistency check between "draft" and "send," gated on both together. That doesn't survive contact with the product's actual constraint: judge scoring and self-consistency sampling are each a full extra model call (self-consistency needs several), typically seconds combined — and Salesperson AI's entire value proposition is a sub-second, no-human response. A gate that takes longer to run than the reply took to generate isn't something a real-time chat product can afford, and the honest version of this proposal has to design around that instead of asserting past it.
 
-1. **Quality score** — an LLM-as-judge rubric score across five weighted dimensions (grounding accuracy, completeness, escalation judgment, tone/brand fit, safety/compliance). Full rubric and judge prompt in `eval-framework.md`.
-2. **Confidence score** — an objective, model-derived signal for *how sure the system should be* that the quality score is right, combining self-consistency (does the model agree with itself across repeated sampling) with a semantic-uncertainty measure. Full methodology in `eval-framework.md`.
+So this splits into three tiers, ordered by how cheap and reliable each one is, matched to where it actually sits in the pipeline:
 
-The two scores combine into a **routing decision**:
+**Tier 0 — Pre-generation topic routing (near-zero latency).**
+Before Salesperson AI drafts anything, a lightweight classifier reads the lead's message and flags its risk category: routine (pricing, availability, scheduling) vs. high-risk (financing/approval language, legal terms, complaints, negotiation past dealer-set limits). High-risk messages skip autonomous generation entirely and go straight into the product's existing "intelligent handoff" behavior — drafted for a human, not sent directly. This is genuine, real-time prevention, and it's cheap because a topic classifier is a much smaller, faster model than a judge reasoning over full rubric + ground-truth context.
 
-| Combined signal | Action |
-|---|---|
-| High quality score + high confidence | **Auto-send** — no added latency |
-| High quality score + low confidence | **Send with flag** — goes out immediately (preserves speed) but is queued for post-hoc human spot-check within the hour |
-| Low quality score (any confidence) | **Hold for human review** before send — reserved for the minority of cases where the judge itself flags a likely violation (e.g., an unverifiable claim or a missed escalation) |
-| Safety-dimension hard-fail (any score) | **Hard block** — never sent unreviewed, regardless of confidence; this is a deliberate override, not a threshold |
+**Tier 1 — Deterministic pre-send checks (near-zero latency).**
+For routine-category replies that do get autonomously generated, a small set of rule-based checks run in the send path: does the reply contain approval-guarantee language ("guaranteed," "you'll definitely be approved")? Does a quoted price or availability claim match the live inventory record (a direct lookup, not a model call)? Fast enough to sit on the critical path without meaningfully affecting response time — this catches the small number of known, specific failure patterns without needing an LLM call at all.
 
-This is the same shape of decision Tekion's own **Accounts Payable AI** already makes publicly (high-confidence invoice fields auto-fill; low-confidence fields are flagged for human review) — this PRD proposes applying that same confidence-based-routing philosophy, which Tekion has already proven out on the back-office side, to the customer-facing side of the product.
+**Tier 2 — Async LLM-as-judge + confidence scoring (off the critical path, runs after send).**
+Every autonomously-sent reply is scored by the full rubric judge and an objective confidence signal *after* it's already gone out. This tier cannot prevent a bad message from reaching a customer — it exists to catch it fast and close the loop: flag violations within minutes, pause any further autonomous follow-up in that thread pending review, log for compliance, and feed newly-discovered failure patterns back into Tier 0's classifier and Tier 1's rules over time — the same "gets smarter with every correction" pattern Accounts Payable AI already uses, applied here as a feedback loop rather than a live gate.
+
+| Tier | Runs | Catches | Latency/cost |
+|---|---|---|---|
+| 0 — Topic routing | Before generation | Known high-risk categories | Near-zero — small classifier |
+| 1 — Deterministic checks | In the send path | Specific known-bad patterns | Near-zero — rules/lookups, no model call |
+| 2 — Judge + confidence | After send, async | Nuanced groundedness, tone, escalation misses, novel failures | Seconds, but off the critical path |
+
+This is a narrower claim than the original version — and a more honest one: real-time **prevention** only for the cheap, known failure modes; fast **detection and remediation** for everything nuanced enough to need genuine semantic judgment, with Tier 2's findings continuously widening what Tiers 0 and 1 can catch on their own.
 
 ## 7. Requirements
 
 ### Functional
-- **FR1**: Every Salesperson AI reply is scored against the five-dimension rubric before or immediately after send (see routing table above for timing).
-- **FR2**: A confidence score is computed per reply using at minimum one objective uncertainty signal (self-consistency or semantic entropy) — not verbalized confidence alone, which the literature shows is the least reliable single signal (see `eval-framework.md` §3).
-- **FR3**: Any reply scoring below threshold on the Safety dimension is hard-blocked from unreviewed send, regardless of aggregate confidence.
-- **FR4**: Routing thresholds are configurable per dealer (mirrors existing tone/FAQ/hours configurability) — a dealer in a highly regulated state, or one that's been burned before, should be able to set a stricter bar.
-- **FR5**: Every scored reply, its rubric breakdown, confidence score, and routing decision are logged and queryable — extends the existing Communication Hub audit trail rather than replacing it.
-- **FR6**: A rolling dashboard (judge/human agreement rate, safety violation rate, escalation precision, score trend by dimension) is available to the CRM AI product team and, in a lighter form, to dealers.
+- **FR1**: A topic/risk classifier runs on every inbound lead message before generation; messages flagged high-risk (financing, legal, complaints, out-of-limit negotiation) route to human-assist drafting rather than autonomous send (Tier 0).
+- **FR2**: Deterministic pattern checks (approval-guarantee language, live-inventory price/availability match) run on every autonomously-generated reply before send; any match blocks send and routes to human review (Tier 1).
+- **FR3**: Every autonomously-sent reply is scored asynchronously by the full five-dimension LLM-as-judge rubric plus an objective confidence signal — this scoring does not gate the send (Tier 2).
+- **FR4**: Any Tier 2 detection of a Safety-dimension violation triggers, without waiting for human pickup: an immediate alert to the assigned rep/manager, an automatic pause on further autonomous follow-up in that thread, and a logged compliance record.
+- **FR5**: Tier 0's classifier and Tier 1's rule set are updated on a defined cadence using confirmed violations Tier 2 surfaces — the feedback loop is a requirement, not a side effect.
+- **FR6**: Every classification, check, and async score is logged and queryable — extends the existing Communication Hub audit trail rather than replacing it.
+- **FR7**: A rolling dashboard (judge/human agreement, safety violation rate, Tier 0/1 catch rate, time-to-detect, time-to-remediate) is available to the CRM AI product team and, in a lighter form, to dealers.
 
 ### Non-functional
-- **NFR1 — Latency budget**: The evaluation layer must add no more than ~300–500ms to the auto-send path (async judge scoring where possible; a fast objective-signal check on the hot path, full judge scoring can complete just after send for the flag/audit case).
-- **NFR2 — Cost budget**: Judge-model calls are the dominant cost driver. Given Tekion's platform already runs an **LLM Gateway** for multi-provider routing and cost tracking (per their own AI Platform Engineer job description), the judge should run on a smaller/distilled model for the hot path with a frontier-model spot-check on a sample, not a frontier judge on every message.
-- **NFR3 — Multi-tenant isolation**: Consistent with how Accounts Payable AI's GL-code learning is scoped per store ("gets smarter with every correction, without affecting any other store"), any per-dealer threshold tuning or calibration data must stay isolated to that dealer.
-- **NFR4 — Explainability**: Every routing decision must be traceable to specific rubric dimensions and the specific span of the reply that triggered it — not just a single opaque score.
+- **NFR1 — Latency budget (Tiers 0+1 only)**: Combined, these must add no more than ~50–150ms to the autonomous-send path — a small classifier plus rule/lookup checks, no full LLM judge call in this budget. This is the only tier with a real latency constraint.
+- **NFR2 — Detection SLA (Tier 2)**: Async scoring and any resulting alert must complete within a defined window (minutes, not hours) of send — Tier 2 has no send-side latency budget, but it does have a freshness requirement, since it's the layer responsible for catching what Tiers 0/1 miss before the same error reaches another lead or an unsupervised follow-up sequence continues.
+- **NFR3 — Cost budget**: Tier 2's judge + confidence pipeline is the dominant cost driver. Given Tekion's platform already runs an **LLM Gateway** for multi-provider routing and cost tracking, Tier 2 should run on a smaller/distilled model for full-traffic coverage, with a frontier-model spot-check on a 5–10% sample to catch drift.
+- **NFR4 — Multi-tenant isolation**: Consistent with how Accounts Payable AI's GL-code learning is scoped per store, Tier 0/1 rule updates learned from one dealership's Tier 2 findings must not silently change another dealership's behavior without going through the same calibration discipline.
+- **NFR5 — Explainability**: Every Tier 0/1/2 decision is traceable to the specific rule, pattern match, or rubric dimension that triggered it — not a single opaque score.
 
 ## 8. System Design (Architecture Summary)
 
@@ -93,29 +100,46 @@ This is the same shape of decision Tekion's own **Accounts Payable AI** already 
 Lead message received
         │
         ▼
+┌───────────────────────────────┐
+│ TIER 0 — Topic/risk classifier │   near-zero latency
+│  routine   → autonomous path   │
+│  high-risk → human-assist draft│
+└───────────────────────────────┘
+        │ (routine path)
+        ▼
 Salesperson AI generates draft reply
   (existing system — grounded in live inventory/deal context)
         │
         ▼
-┌─────────────────────────────────────────┐
-│   CONFIDENCE-ROUTED EVALUATION LAYER      │
-│                                           │
-│  ① Fast objective confidence check        │
-│     (self-consistency sample / entropy)   │
-│                                           │
-│  ② LLM-as-judge rubric scoring            │
-│     (5 dimensions, weighted)              │
-│                                           │
-│  ③ Routing decision                       │
-│     auto-send / send+flag / hold / block  │
-└─────────────────────────────────────────┘
+┌───────────────────────────────┐
+│ TIER 1 — Deterministic checks  │   near-zero latency, no model call
+│  guarantee-language pattern    │
+│  price/availability vs. live   │
+│  inventory lookup              │
+└───────────────────────────────┘
+        │
+   pass │            fail → hold for human review before send
+        ▼
+     SEND to lead
+        │
+        ▼  (off critical path, async)
+┌───────────────────────────────┐
+│ TIER 2 — LLM-as-judge +        │   seconds, async — full traffic
+│ confidence scoring             │
+└───────────────────────────────┘
         │
         ▼
-   Route per decision table (§6)
+ violation? ──yes──▶ alert rep/manager, pause thread's autonomous
+        │             follow-up, log for compliance
+        no
+        ▼
+ feed into Tier 0/1 rule + classifier updates (periodic recalibration)
         │
         ▼
 Audit log + dashboard (extends Communication Hub)
 ```
+
+The key shift from an earlier version of this design: Tiers 0 and 1 are the only components with a real-time latency budget, and they're intentionally cheap and narrow — a topic classifier and a rules engine, not a semantic judge. Tier 2 does the actual nuanced evaluation, but never on the send path.
 
 Full technical detail — the judge prompt itself, how the confidence signal is computed, why these specific methods over alternatives — is in **[`eval-framework.md`](./eval-framework.md)**, which this PRD deliberately keeps separate so the product framing here doesn't get lost in implementation detail.
 
@@ -123,32 +147,37 @@ Full technical detail — the judge prompt itself, how the confidence signal is 
 
 | Metric | What it tells us |
 |---|---|
-| **Safety violation rate** (unauthorized commitments / discriminatory language / PII mishandling per 1,000 sends) | The core risk metric this whole layer exists to move |
-| **Escalation precision & recall** | Is the system correctly identifying when a human is actually needed — false negatives here are the dangerous failure mode, false positives just cost speed |
-| **Judge–human agreement (Cohen's κ)** | Is the automated judge actually trustworthy, or scoring drift/noise — target κ > 0.8, industry-typical threshold for a production-grade judge (see `eval-framework.md` §5) |
-| **% of messages auto-sent with zero added latency** | Proxy for whether the layer is preserving the product's core speed advantage |
-| **Added p95 latency on auto-send path** | Must stay within NFR1's budget |
-| **Cost per evaluated message** | Judge-model spend, tracked against the Gateway's existing cost-tracking |
-| **Downstream: lead conversion rate, delta pre/post** | Ultimate business metric — the hypothesis is that this layer is conversion-neutral-to-positive (catches the failures that would have cost a deal or a complaint) without being a conversion drag from added friction |
+| **Safety violation rate reaching a customer** (per 1,000 autonomous sends) | The core risk metric — note this can never be driven to zero, since Tiers 0/1 are necessarily incomplete; the honest goal is minimizing it and shrinking how long a violation stays live |
+| **Tier 0 catch rate** (precision/recall of high-risk-topic routing) | Effectiveness of the only real-time prevention lever in the system |
+| **Tier 1 catch rate** (% of guarantee-language/price-mismatch patterns caught pre-send) | Effectiveness of the cheap deterministic layer |
+| **Time-to-detect** (send → Tier 2 flag) | Whether the async loop is actually fast enough to matter |
+| **Time-to-remediate** (flag → rep action / thread paused) | Whether detection translates into a stopped follow-up sequence, not just a log entry nobody acts on |
+| **Judge–human agreement (Cohen's κ)** | Trustworthiness of Tier 2's scoring itself — target κ > 0.8 (see `eval-framework.md` §5) |
+| **Tier 0/1 rules added per cycle from Tier 2 findings** | Whether the feedback loop is actually closing — makes the "gets smarter over time" claim measurable instead of aspirational |
+| **Added p95 latency, autonomous send path (Tiers 0+1 only)** | Must stay within NFR1's tight budget — this is the one path with a real latency constraint |
+| **Downstream: lead conversion rate, delta pre/post** | Ultimate business metric |
 
 ## 10. Rollout Plan
 
-1. **Shadow mode** — layer runs on all traffic, scores and routes are logged, but nothing changes about what actually gets sent. Purpose: build the calibration/gold-set and measure what the routing *would have done* against real traffic before it affects anything.
-2. **Limited pilot** — enable actual hold/block routing for a small number of pilot dealerships, ideally ones already flagged as higher-risk (financing-heavy stores, states with stricter advertising/lending disclosure rules).
-3. **Gradual threshold tightening** — start conservative (more messages routed to send+flag than the steady state would need), tighten thresholds as judge-human agreement and dealer feedback validate the calibration.
-4. **General availability** — default routing config ships for all dealers, with the existing per-dealer configurability pattern extended to risk thresholds.
+1. **Shadow mode** — all three tiers run on all traffic, but only in observe mode: Tier 0/1 log what they *would have* blocked or rerouted without actually doing so, Tier 2 scores everything. Purpose: build the calibration/gold-set and measure what each tier would have done against real traffic before any of it takes effect.
+2. **Limited pilot** — turn on real Tier 0/1 enforcement (actual reroute/block) for a small number of pilot dealerships, ideally ones already flagged as higher-risk (financing-heavy stores, states with stricter advertising/lending disclosure rules). Tier 2 stays fully async throughout — it doesn't need a pilot gate since it never blocks anything.
+3. **Gradual threshold tightening** — start Tier 0's classifier conservative (over-routes to human-assist), tighten as Tier 2's findings and dealer feedback validate where the real risk boundary is.
+4. **General availability** — default Tier 0/1 configuration ships for all dealers, with the existing per-dealer configurability pattern extended to risk-category thresholds.
 
 ## 11. Risks & Mitigations
 
 | Risk | Mitigation |
 |---|---|
+| Tier 0's classifier misses a genuinely high-risk message and it slips into autonomous generation | Defense in depth, not a single point of failure — Tier 1's deterministic patterns are a second line, Tier 2's fast detection/remediation is a third; no single tier is assumed sufficient on its own |
 | Judge model itself is biased or drifts over time | Calibration against a human-labeled gold set on a fixed cadence; cross-family spot-check against a frontier judge on a sample (see `eval-framework.md` §5) |
-| Added latency erodes the speed advantage that's the entire product thesis | Async scoring on the hot path, hard latency budget (NFR1), fast objective-signal check before full judge scoring |
+| Tier 0/1 latency budget erodes the speed advantage that's the entire product thesis | Hard latency budget (NFR1) applies only to the cheap tiers by design — no LLM judge call sits anywhere on the send path |
+| Confidence-signal calibration degrades as inventory, promotions, or the underlying model change | Rolling recalibration cadence rather than a one-time calibration, since the statistical guarantee depends on an assumption (calibration/live-traffic exchangeability) that a live dealership environment will routinely violate (see `eval-framework.md` §3.4) |
 | Dealers perceive the layer as the AI "getting worse" or slower | Frame and surface it as a trust feature in-product (dashboard, "AI acceptance rate" style metric dealers already understand from Service AI) rather than a hidden backend change |
-| Over-blocking erodes trust in the AI internally at Tekion (false positives treated as the AI being unreliable) | Track and report escalation precision, not just recall — a routing layer that's accurate about *when* it's uncertain is different from one that's just cautious |
+| Over-blocking at Tier 0 erodes trust in the AI internally (false positives treated as the AI being unreliable) | Track and report Tier 0 precision, not just recall — a classifier that's accurate about *when* it's uncertain is different from one that's just cautious |
 
 ## 12. Open Questions
 
-- Does Tekion's existing LLM Gateway already expose per-call confidence/logprob data, or would this require a new capability in that layer?
+- What's the acceptable false-negative rate for Tier 0's topic classifier, and who owns setting it — Tekion centrally, or per dealer given FR1's configurability precedent?
+- Tier 1's inventory-match check depends on a live lookup — in a fast-moving inventory system, is a millisecond-stale mismatch a block or just a flag? Getting this wrong in either direction has a real cost (false blocks on correct replies vs. missed stale-price sends).
 - Should routing thresholds be globally tuned by Tekion or fully dealer-configurable — and if dealer-configurable, what's the default risk tolerance that ships out of the box?
-- How does this interact with the "one-click disengage" feature — should a dealer disengaging AI on a lead also surface why (e.g., was the AI's confidence trending low on that thread before the disengage)?
+- How does this interact with the "one-click disengage" feature — should a dealer disengaging AI on a lead also surface why (e.g., a Tier 2 violation flagged on that thread before the disengage)?

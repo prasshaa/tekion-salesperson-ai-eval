@@ -65,15 +65,23 @@ This is the part of the pipeline that answers a different question than the judg
 - **Verbalized confidence** — simply asking the model to state its own confidence ("Confidence: 73%") as part of its output. Cheap and model-agnostic, but the literature is fairly clear that verbalized confidence is the **least reliable single signal** on its own — models are frequently overconfident, and verbalized scores don't reliably track actual correctness. It's reasonable to *include* as one input, but not to rely on alone — which is why FR2 in the PRD explicitly requires at least one objective signal alongside it.
 - **Conformal prediction** — a statistical calibration layer that sits on top of any of the above signals and provides a **formal, distribution-free coverage guarantee**: given a calibration set, you can say "responses accepted by this rule are correct at least (1−α) of the time" with a mathematical guarantee, rather than a heuristic threshold. This is the most rigorous option and the one with the clearest story for a compliance-sensitive, ISO 42001-certified environment like Tekion's — it turns "we think this threshold is about right" into a measurable, auditable statistical claim.
 
-### 3.3 The approach this framework uses
+### 3.3 Where this framework actually uses each method — and where it doesn't
 
-Given Tekion's platform is explicitly multi-provider/model-agnostic (per their own AI Platform Engineer job description — "vendor-agnostic thinker: choose the right model/provider per use case"), a confidence method that depends on provider-specific logit access is a poor architectural fit. This framework therefore combines:
+An earlier version of this framework proposed self-consistency sampling as a **pre-send gate**. That doesn't hold up: self-consistency requires generating the same reply multiple times at nonzero temperature, which is several times the cost and latency of a single generation — not something a sub-second, no-human-in-the-loop chat product can afford on its hot path. Rather than quietly assume that cost away, this framework restricts confidence scoring to where it's actually affordable: **Tier 2, async, after send** (see §3.4 and `PRD.md` §6).
 
-1. **Self-consistency sampling** as the primary objective signal (black-box, provider-agnostic, directly usable through the Gateway regardless of which model is generating a given reply).
-2. **Conformal calibration** on top of the raw self-consistency signal, so the resulting confidence score isn't just a heuristic — it's calibrated against a held-out set to a stated coverage target (e.g., "flagged-as-low-confidence replies are wrong at least X% of the time less often than unflagged ones," measured, not assumed).
-3. **Verbalized confidence as a secondary, low-cost input** — cheap to collect alongside the primary generation call, folded in as one signal among several rather than trusted alone, consistent with what the literature supports it for.
+Given that placement, and given Tekion's platform is explicitly multi-provider/model-agnostic (per their own AI Platform Engineer job description — "vendor-agnostic thinker: choose the right model/provider per use case"), a confidence method that depends on provider-specific logit access is still a poor fit. This framework combines, on the async path only:
 
-This mirrors a broader pattern that's become standard for high-stakes automated decisions: combine an **objective/statistical signal** (self-consistency, calibrated) with a **subjective/rubric-based signal** (the LLM-as-judge score from §2) rather than relying on either alone — because they fail in different, largely uncorrelated ways. A judge can be fooled by a fluent, confident-sounding wrong answer; a pure consistency signal can be confidently wrong if the model is *consistently* wrong (e.g., systematically misremembering a stale price it was pretrained on). Combining both closes more of the gap than either alone.
+1. **Self-consistency sampling** as the primary objective signal (black-box, provider-agnostic) — run on a bounded sample of Tier 2 traffic, not necessarily every message, since even off the critical path the generation cost of multiple samples adds up at volume.
+2. **Conformal calibration** on top of the raw self-consistency signal, so the resulting confidence score is calibrated against a held-out set rather than an arbitrary threshold — with the caveat in §3.4 about what that calibration can and can't promise here.
+3. **Verbalized confidence as a secondary, near-zero-cost input** — collected alongside the primary generation call at effectively no extra cost, so it can run on 100% of traffic even where sampled self-consistency can't, folded in as one weak signal among several rather than trusted alone.
+
+This still combines an **objective/statistical signal** with a **subjective/rubric-based signal** (the judge, §2) rather than relying on either alone, because they fail differently — a judge can be fooled by a fluent, confident-sounding wrong answer; a consistency signal can be confidently wrong if the model is *consistently* wrong. What's changed from the earlier version is *when* this combination runs (async detection, not a live gate) and an honest accounting of what it's actually measuring.
+
+### 3.4 Two things worth being upfront about
+
+**"Confidence in what," precisely?** Self-consistency measures uncertainty in the *generated reply itself* — how much the model's own outputs vary across resampling. The judge score measures *quality* of that same reply. Neither of these is literally "confidence that the quality score is correct," which is the framing the original version of this doc used. That third thing — judge self-uncertainty — isn't being measured here at all; what's actually combined is two independent read-outs on the reply (how quality-scored, how stable-under-resampling), not a confidence-on-a-confidence layer. Worth stating plainly rather than letting the phrase "confidence score" imply more precision than the pipeline delivers.
+
+**The methods are validated on a different kind of task than this one.** Most self-consistency and semantic-entropy literature is benchmarked on QA-style tasks with one correct answer, where "the model said something different across samples" is unambiguous evidence of uncertainty. Salesperson AI replies are open-ended free text — many differently-worded replies are equally correct, so phrasing variance across samples is a noisier signal here than in the settings these methods were proven in. And conformal prediction's coverage guarantee assumes calibration data and live traffic are exchangeable (same distribution) — an assumption a dealership environment breaks constantly: inventory turns over daily, the Gateway can swap the underlying model, financing terms shift seasonally. The mitigation is a **rolling, frequently-refreshed calibration set** rather than a one-time calibration treated as a permanent guarantee — but that's a mitigation, not a fix, and it's fair to expect this signal to be noisier in production than the papers it's drawn from would suggest.
 
 ---
 
@@ -141,31 +149,35 @@ A judge (and a confidence signal) is only as trustworthy as its calibration disc
 - **Agreement metric**: Cohen's κ between judge scores and human labels on the gold-set, not raw percent-agreement (percent-agreement alone doesn't correct for chance agreement and overstates reliability, especially on skewed data — which this is, since most replies are fine and only a minority are violations). **Target: κ > 0.8** before a judge configuration is trusted for production routing decisions; this is the threshold the field treats as "strong agreement," and it's a genuinely appropriate bar to set for a decision that gates whether a human ever sees a message before a real customer does.
 - **Frontier cross-check**: 5–10% of the distilled judge's production scores are re-scored by a frontier-tier judge on a rolling basis, to catch drift between calibration cycles rather than waiting for the next quarterly refresh.
 - **Versioning discipline**: the tuple (judge model ID, rubric version, prompt template hash) is pinned per deployment. Any change to any part of that tuple is treated as an evaluation-suite migration — re-run against the gold-set, re-measure κ, don't ship silently. Swapping the judge model without re-calibration is a common, avoidable failure mode.
-- **Confidence-signal calibration**: the conformal layer (§3.3) is calibrated on its own held-out set, separate from the judge's gold-set, since it's answering a different question (how reliable is this specific reply likely to be) than the judge (was this specific reply good).
+- **Confidence-signal calibration**: the conformal layer (§3.3–3.4) is calibrated on its own held-out set, separate from the judge's gold-set, since it's answering a different question (how reliable is this specific reply likely to be) than the judge (was this specific reply good) — and given §3.4's exchangeability caveat, this calibration set is refreshed on a **rolling basis**, not a fixed quarterly cadence like the judge's gold-set, since inventory and model drift can invalidate it faster than a quarter.
 
 ---
 
-## 6. Confidence + Quality → Routing Table (Reference)
+## 6. Where Each Signal Actually Acts (Reference)
 
-| Quality score | Confidence score | Route |
-|---|---|---|
-| High (weighted ≥ 4.0) | High | Auto-send |
-| High (weighted ≥ 4.0) | Low | Send + flag for post-hoc spot-check |
-| Medium (2.5–4.0) | Any | Hold for human review before send |
-| Low (< 2.5) | Any | Hold for human review before send |
-| Any score | Safety dimension = 1 (hard rule) | Hard block — never auto-sent |
+The routing logic isn't one table anymore — it's split by tier, because quality and confidence scores from Tier 2 are never available before a message sends. What each tier controls:
 
-This is the same underlying pattern as Tekion's own Accounts Payable AI (confidence-scored field extraction, high-confidence auto-fills, low-confidence routes to a human) — applied here to a customer-facing, real-time context instead of a back-office, asynchronous one, which is why the latency budget (PRD NFR1) is a much harder constraint here than it would be for invoice processing.
+| Tier | Signal used | Decision | Timing relative to send |
+|---|---|---|---|
+| 0 | Topic classifier output | Autonomous generation vs. human-assist draft | Before generation |
+| 1 | Deterministic pattern match / inventory lookup | Send vs. hold for human review | Immediately pre-send |
+| 2 | Judge rubric score + confidence score | Alert + pause thread vs. no action; feeds Tier 0/1 rule updates | After send, async |
+
+Tier 2's judge score and confidence score are combined the same way the original single-table version described — high quality + high confidence needs no action, low quality or a safety hard-fail triggers an alert — the difference is that this combination now happens **after the message is already out**, driving remediation speed and future rule-tightening rather than a live send/hold decision. That's a materially different (and more defensible) claim than the original table made.
+
+This still borrows the same underlying philosophy as Tekion's own Accounts Payable AI — confidence-scored extraction, high-confidence auto-processed, low-confidence routed to a human — but AP invoices sit in an async queue regardless, so AP AI can afford to gate on confidence *before* acting. Salesperson AI can't, which is exactly why this framework moved the equivalent gate to Tiers 0/1 (cheap, real-time) and kept the AP-style confidence gating for Tier 2 (expensive, but no longer pretending to be real-time).
 
 ---
 
 ## 7. Metrics Glossary (for the dashboard referenced in PRD §9)
 
 - **Judge–human agreement (κ)** — Cohen's kappa between judge and human labels on the gold-set; the primary trust metric for the judge itself.
-- **Safety violation rate** — violations per 1,000 sends, as scored by the hard-rule Safety dimension; the primary business-risk metric.
-- **Escalation precision / recall** — of messages the judge flags as needing escalation, what fraction actually needed it (precision) and of messages that actually needed escalation, what fraction were caught (recall). Recall is the more dangerous metric to under-invest in — a missed escalation is the costlier failure than an unnecessary one.
-- **Coverage (from conformal calibration)** — the measured, held-out accuracy rate of the confidence layer's "high confidence" bucket, checked against its stated target.
-- **Auto-send rate** — % of total volume routed to auto-send with zero added latency; the metric that tracks whether this layer is preserving the product's speed advantage.
+- **Safety violation rate reaching a customer** — violations per 1,000 autonomous sends that made it past Tiers 0 and 1, as scored by Tier 2's hard-rule Safety dimension; the primary business-risk metric, and the one that's honestly never zero.
+- **Tier 0 / Tier 1 catch rate** — precision and recall of the two real-time layers against Tier 2's after-the-fact findings (a message Tier 2 flags that Tiers 0/1 should have caught is a miss for those tiers, not just a Tier 2 success).
+- **Escalation precision / recall** — of messages routed to human-assist (Tier 0) or flagged post-send (Tier 2) as needing escalation, what fraction actually needed it (precision) and what fraction of messages that needed it were caught (recall). Recall is the more dangerous metric to under-invest in — a missed escalation is costlier than an unnecessary one.
+- **Time-to-detect / time-to-remediate** — send-to-flag and flag-to-action latency for Tier 2; the metrics that determine whether the async loop is fast enough to matter, since Tier 2 by design can't prevent, only catch quickly.
+- **Coverage (from conformal calibration)** — the measured, held-out accuracy rate of the confidence layer's "high confidence" bucket against its stated target, re-measured on the rolling cadence described in §3.4 rather than assumed stable.
+- **Tier 0/1 rules added per cycle** — how many of Tier 2's confirmed findings actually became new real-time rules; the concrete version of "the system gets smarter over time."
 
 ---
 

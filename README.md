@@ -21,8 +21,8 @@ Everything here — the PRD, the eval methodology, the working prototype — is 
 | File | What it is |
 |---|---|
 | [`PRD.md`](./PRD.md) | Full product requirements doc — what Salesperson AI is today, the problem, the proposed solution, requirements, success metrics, rollout plan |
-| [`eval-framework.md`](./eval-framework.md) | The deep technical spec — LLM-as-judge methodology, confidence-scoring approaches, the actual judge prompt, routing logic, calibration plan, and how each choice maps to current industry practice |
-| [`demo/index.html`](./demo/index.html) | A working, interactive prototype — a scored rubric applied to sample Salesperson AI conversations, plus an aggregate quality dashboard |
+| [`eval-framework.md`](./eval-framework.md) | The deep technical spec — LLM-as-judge methodology, confidence-scoring approaches, the actual judge prompt, the tiered detection/prevention split, calibration plan, and how each choice maps to current industry practice |
+| [`demo/index.html`](./demo/index.html) | A working, interactive prototype — traces sample Salesperson AI messages through the three-tier pipeline, plus an aggregate quality dashboard |
 
 ## Live demo
 
@@ -34,7 +34,18 @@ Once hosted on GitHub Pages: `https://prasshaa.github.io/tekion-salesperson-ai-e
 
 Salesperson AI is already one of the more autonomous agents in Tekion's portfolio — it sends real messages to real leads with no human in the loop for the routine case. That's the right design for speed, but it means the actual product risk isn't "does the agent answer well" — it's **"what happens the one time it doesn't."** A single unauthorized promise (a financing guarantee, an incorrect price lock) sent to a real customer is a materially different failure than a low-quality chatbot answer.
 
-The proposal: a **confidence-routed evaluation layer** sitting between response generation and send — combining an **LLM-as-judge rubric score** (is this response good) with an **objective confidence signal** (how sure is the model it's right) into one routing decision: auto-send, hold for human review, or escalate. Full detail in `PRD.md` and `eval-framework.md`.
+An earlier version of this proposal put a full LLM-as-judge + confidence check on the send path itself — which doesn't survive contact with the product's actual latency budget; that kind of check takes seconds, and Salesperson AI's entire value is a sub-second response. The current proposal splits the problem into **three tiers**: a cheap pre-generation topic classifier and a cheap deterministic pattern/lookup check handle real-time **prevention** for the known failure modes, while a full LLM-as-judge + confidence pipeline runs **async, after send**, to catch and rapidly remediate the more nuanced failures those cheap layers can't — and to keep feeding what it learns back into the real-time layers. Full detail, including the walk-through of why the simpler version didn't hold up, in `PRD.md` and `eval-framework.md`.
+
+## Pushing this to GitHub
+
+```bash
+cd tekion-salesperson-ai-eval
+git remote add origin https://github.com/prasshaa/tekion-salesperson-ai-eval.git
+git branch -M main
+git push -u origin main
+```
+
+Then enable **Settings → Pages → Deploy from branch → main / (root)** to serve `demo/index.html` publicly.
 
 ---
 
